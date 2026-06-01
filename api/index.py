@@ -33,23 +33,79 @@ class AllMovieLandM3UExtractor:
             response = self.session.get(play_url, timeout=15)
             html = response.text
             
-            # Extract the p3 object
-            p3_match = re.search(r'let\s+p3\s*=\s*({[^;]+});', html)
-            if not p3_match:
-                return {'error': 'Could not find player data', 'video_id': video_id}
+            # Try multiple patterns to find player data
+            player_data = None
             
-            # Parse JSON
-            json_str = p3_match.group(1)
-            json_str = json_str.replace('\\/', '/')
-            player_data = json.loads(json_str)
+            # Pattern 1: let p3 = {...};
+            p3_match = re.search(r'let\s+p3\s*=\s*({.*?});', html, re.DOTALL)
+            if p3_match:
+                try:
+                    json_str = p3_match.group(1)
+                    # Fix common JSON issues
+                    json_str = re.sub(r'(\w+):', r'"\1":', json_str)  # Add quotes to keys
+                    json_str = json_str.replace("'", '"')  # Replace single quotes
+                    json_str = json_str.replace('\\/', '/')
+                    player_data = json.loads(json_str)
+                    print("Found player data with pattern 1")
+                except:
+                    pass
             
-            if 'file' not in player_data:
-                return {'error': 'No file URL in player data', 'video_id': video_id}
+            # Pattern 2: var p3 = {...};
+            if not player_data:
+                p3_match = re.search(r'var\s+p3\s*=\s*({.*?});', html, re.DOTALL)
+                if p3_match:
+                    try:
+                        json_str = p3_match.group(1)
+                        json_str = re.sub(r'(\w+):', r'"\1":', json_str)
+                        json_str = json_str.replace("'", '"')
+                        json_str = json_str.replace('\\/', '/')
+                        player_data = json.loads(json_str)
+                        print("Found player data with pattern 2")
+                    except:
+                        pass
+            
+            # Pattern 3: Look for any object with "file" property
+            if not player_data:
+                file_match = re.search(r'\{[^{}]*"file"\s*:\s*"[^"]+"[^{}]*\}', html)
+                if file_match:
+                    try:
+                        json_str = file_match.group(0)
+                        player_data = json.loads(json_str)
+                        print("Found player data with pattern 3")
+                    except:
+                        pass
+            
+            # Pattern 4: Look for p3 = {...} without var/let
+            if not player_data:
+                p3_match = re.search(r'p3\s*=\s*({.*?});', html, re.DOTALL)
+                if p3_match:
+                    try:
+                        json_str = p3_match.group(1)
+                        json_str = re.sub(r'(\w+):', r'"\1":', json_str)
+                        json_str = json_str.replace("'", '"')
+                        json_str = json_str.replace('\\/', '/')
+                        player_data = json.loads(json_str)
+                        print("Found player data with pattern 4")
+                    except:
+                        pass
+            
+            if not player_data or 'file' not in player_data:
+                # Debug: Save the HTML for inspection
+                with open('debug.html', 'w') as f:
+                    f.write(html)
+                
+                return {
+                    'error': 'Could not find player data',
+                    'video_id': video_id,
+                    'debug': 'HTML saved to debug.html',
+                    'html_preview': html[:1000]  # Send first 1000 chars for debugging
+                }
             
             file_url = player_data['file']
             referrer = player_data.get('referrer', urlparse(play_url).netloc)
             
-            print(f"Fetching file: {file_url}")
+            print(f"File URL: {file_url}")
+            print(f"Referrer: {referrer}")
             
             # Fetch the .txt file with correct referrer
             file_response = self.session.get(
@@ -59,37 +115,29 @@ class AllMovieLandM3UExtractor:
             )
             
             content = file_response.text
+            print(f"File content length: {len(content)}")
             
             # Extract m3u8 URLs from the content
             m3u8_links = []
             
-            # Look for m3u8 URLs (both http and https)
+            # Look for m3u8 URLs
             m3u8_pattern = r'https?://[^\s"\']+\.m3u8[^\s"\']*'
             m3u8_links = re.findall(m3u8_pattern, content)
             
-            # Also look for relative paths
-            rel_pattern = r'["\'](/[^\s"\']+\.m3u8[^\s"\']*)["\']'
-            rel_matches = re.findall(rel_pattern, content)
-            for rel_path in rel_matches:
-                # Resolve relative path
-                base_domain = f"https://{referrer}"
-                full_url = base_domain + rel_path if rel_path.startswith('/') else f"{base_domain}/{rel_path}"
-                m3u8_links.append(full_url)
-            
-            # If content itself is a m3u8 playlist, parse it
+            # If content is a m3u8 playlist, parse it line by line
             if '#EXTM3U' in content and not m3u8_links:
                 lines = content.strip().split('\n')
                 for line in lines:
                     line = line.strip()
                     if line and not line.startswith('#') and not line.startswith('//'):
-                        if line.startswith('http'):
+                        if 'http' in line:
                             m3u8_links.append(line)
-                        elif '/' in line:
+                        elif line.endswith('.m3u8') or line.endswith('.ts'):
                             # Relative URL
                             base_url = file_url.rsplit('/', 1)[0]
                             m3u8_links.append(f"{base_url}/{line}")
             
-            # Remove duplicates while preserving order
+            # Remove duplicates
             m3u8_links = list(dict.fromkeys(m3u8_links))
             
             if m3u8_links:
