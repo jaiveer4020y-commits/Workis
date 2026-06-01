@@ -8,18 +8,21 @@ import ssl
 
 ALLMOVIELAND_API = "https://allmovieland.one"
 
-# Bypass SSL verification
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
 SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
-def fetch(url, method="GET", headers=None, referer=None):
-    req_headers = {"User-Agent": "Mozilla/5.0"}
+def fetch(url, method="GET", headers=None, referer=None, data=None):
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "*/*",
+    }
     if headers:
         req_headers.update(headers)
     if referer:
         req_headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=req_headers, method=method)
+    post_data = data.encode("utf-8") if data else None
+    req = urllib.request.Request(url, headers=req_headers, method=method, data=post_data)
     with urllib.request.urlopen(req, context=SSL_CONTEXT) as r:
         return r.read().decode("utf-8")
 
@@ -52,37 +55,48 @@ class handler(BaseHTTPRequestHandler):
         try:
             # 1. Get CDN host from player.js
             player_script = fetch(f"{ALLMOVIELAND_API}/player.js?v=60%20128")
-            match = re.search(r"const AwsIndStreamDomain.*'(.*)';", player_script)
+            match = re.search(r"const AwsIndStreamDomain\s*=\s*'(https?://[^']+)'", player_script)
             if not match:
-                self._respond(500, {"error": "Could not extract stream domain"})
+                self._respond(500, {"error": "Could not extract stream domain", "js_snippet": player_script[:300]})
                 return
-            host = match.group(1)
+            host = match.group(1).rstrip("/")
             referer = f"{ALLMOVIELAND_API}/"
 
-            # 2. Get playlist data from player page
-            player_html = fetch(f"{host}//play/{id_}", referer=referer)
-            script_match = re.search(r"<script[^>]*>([\s\S]*?playlist[\s\S]*?)</script>", player_html)
+            # 2. Get playlist data from CDN play page (NOT allmovieland.one)
+            play_url = f"{host}/play/{id_}"
+            player_html = fetch(play_url, referer=referer)
+
+            # Extract playlist JSON from script tag
             json_str = None
+            script_match = re.search(r"<script[^>]*>([\s\S]*?playlist[\s\S]*?)</script>", player_html)
             if script_match:
                 content = script_match.group(1)
-                brace_idx = content.index("{")
-                after = content[brace_idx:]
-                raw = after[:after.index(";")].rstrip(")")
-                json_str = "{" + raw.strip()
+                try:
+                    brace_idx = content.index("{")
+                    after = content[brace_idx:]
+                    raw = after[:after.index(";")].rstrip(")")
+                    json_str = "{" + raw.strip()
+                except ValueError:
+                    pass
 
             playlist = try_parse_json(json_str or "{}")
             if not playlist or not playlist.get("key") or not playlist.get("file"):
-                self._respond(500, {"error": "Could not parse playlist data", "raw": json_str})
+                self._respond(500, {
+                    "error": "Could not parse playlist data",
+                    "play_url": play_url,
+                    "raw": json_str,
+                    "html_snippet": player_html[:500]
+                })
                 return
 
             headers = {"X-CSRF-TOKEN": playlist["key"], "Referer": referer}
 
             # 3. Fetch servers list
             server_url = fix_url(playlist["file"], host)
-            server_text = re.sub(r",\s*\[\]", "", fetch(server_url, headers=headers))
+            server_text = re.sub(r",\s*\[\]", "", fetch(server_url, headers=headers, referer=referer))
             servers = try_parse_json(server_text)
             if not servers:
-                self._respond(500, {"error": "Could not parse servers list"})
+                self._respond(500, {"error": "Could not parse servers list", "raw": server_text[:300]})
                 return
 
             # 4. Select entries by season/episode
@@ -100,7 +114,12 @@ class handler(BaseHTTPRequestHandler):
             for entry in entries:
                 if not entry.get("file"):
                     continue
-                path = fetch(f"{host}/playlist/{entry['file']}.txt", method="POST", headers=headers)
+                path = fetch(
+                    f"{host}/playlist/{entry['file']}.txt",
+                    method="POST",
+                    headers=headers,
+                    referer=referer
+                )
                 links.append({
                     "source": f"Allmovieland [{entry.get('title')}]",
                     "name": f"Allmovieland [{entry.get('title')}]",
