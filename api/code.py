@@ -60,7 +60,7 @@ class handler(BaseHTTPRequestHandler):
             referer = f"{ALLMOVIELAND_API}/"
 
             # 2. Get playlist data from player page
-            player_html = fetch(f"{host}/play/{id_}", referer=referer)
+            player_html = fetch(f"{host}//play/{id_}", referer=referer)
             script_match = re.search(r"<script[^>]*>([\s\S]*?playlist[\s\S]*?)</script>", player_html)
             json_str = None
             if script_match:
