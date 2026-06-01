@@ -5,7 +5,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-ALLMOVIELAND_API = "https://allmovieland.link"
+ALLMOVIELAND_API = "https://allmovieland.one"
 
 def fetch(url, method="GET", headers=None, referer=None):
    req_headers = {"User-Agent": "Mozilla/5.0"}
