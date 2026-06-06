@@ -91,8 +91,9 @@ class AllMovieLandM3UExtractor:
             
             if not player_data or 'file' not in player_data:
                 # Debug: Save the HTML for inspection
-                with open('debug.html', 'w') as f:
-                    f.write(html)
+                self._respond(200, {"debug_html": player_html[:1000]})
+return
+
                 
                 return {
                     'error': 'Could not find player data',
