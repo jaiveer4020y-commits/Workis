@@ -1,175 +1,205 @@
-# api/index.py
-from flask import Flask, request, jsonify
-import requests
-import re
-import json
-from urllib.parse import urlparse
-import sys
-import traceback
+import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-app = Flask(__name__)
+interface AllMovielandPlaylist {
+  key?: string;
+  file?: string;
+}
 
-class AllMovieLandM3UExtractor:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive'
-        })
+interface AllMovielandServer {
+  id: string;
+  file: string;
+  title: string;
+  folder?: Array<{
+    episode: number;
+    folder?: Array<{
+      file: string;
+      title: string;
+    }>;
+  }>;
+}
+
+async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 3): Promise<Response> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(url, options);
+      if (response.ok) return response;
+    } catch (error) {
+      if (i === maxRetries - 1) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
+  throw new Error(`Failed to fetch ${url}`);
+}
+
+async function getPlayerScript(): Promise<string> {
+  const response = await fetchWithRetry(
+    'https://allmovieland.link/player.js?v=60%20128',
+    { headers: { 'User-Agent': 'Mozilla/5.0' } }
+  );
+  return response.text();
+}
+
+function extractHost(script: string): string | null {
+  const domainRegex = /const AwsIndStreamDomain.*'(.*)';/;
+  const match = domainRegex.exec(script);
+  return match?.[1] || null;
+}
+
+function parseJson<T>(jsonString: string): T | null {
+  try {
+    return JSON.parse(jsonString);
+  } catch {
+    return null;
+  }
+}
+
+async function getPlaylistData(host: string, id: string, referer: string): Promise<string | null> {
+  const response = await fetchWithRetry(
+    `${host}/play/${id}`,
+    { headers: { Referer: referer, 'User-Agent': 'Mozilla/5.0' } }
+  );
+  
+  const html = await response.text();
+  const scriptMatch = /playlist[^}]*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}/.exec(html);
+  
+  if (!scriptMatch) return null;
+  return scriptMatch[1];
+}
+
+async function getServers(fileUrl: string, host: string, key: string, referer: string): Promise<string> {
+  const response = await fetchWithRetry(
+    fileUrl,
+    {
+      headers: {
+        'X-CSRF-TOKEN': key,
+        Referer: referer,
+        'User-Agent': 'Mozilla/5.0'
+      }
+    }
+  );
+  
+  let text = await response.text();
+  return text.replace(/,\s*\[\]/g, '');
+}
+
+async function getServerPath(host: string, serverId: string, key: string, referer: string): Promise<string> {
+  const response = await fetchWithRetry(
+    `${host}/playlist/${serverId}.txt`,
+    {
+      method: 'POST',
+      headers: {
+        'X-CSRF-TOKEN': key,
+        Referer: referer,
+        'User-Agent': 'Mozilla/5.0'
+      }
+    }
+  );
+  
+  return response.text();
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  
+  const { id, season, episode } = req.query;
+  const allmovielandAPI = 'https://allmovieland.link';
+  
+  if (!id) {
+    return res.status(400).json({ error: 'id parameter is required' });
+  }
+  
+  try {
+    // Get player script
+    const playerScript = await getPlayerScript();
+    const host = extractHost(playerScript);
     
-    def extract_m3u8_from_url(self, play_url):
-        try:
-            # Clean URL
-            play_url = play_url.replace('//play/', '/play/')
-            
-            # Extract video ID
-            video_id_match = re.search(r'/play/(tt?\d+)', play_url)
-            video_id = video_id_match.group(1) if video_id_match else None
-            
-            # Fetch player page
-            print(f"Fetching: {play_url}")
-            response = self.session.get(play_url, timeout=15)
-            html = response.text
-            
-            # Find player data
-            player_data = None
-            patterns = [
-                r'let\s+p3\s*=\s*({.*?});',
-                r'var\s+p3\s*=\s*({.*?});',
-                r'p3\s*=\s*({.*?});',
-                r'const\s+p3\s*=\s*({.*?});'
-            ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, html, re.DOTALL)
-                if match:
-                    try:
-                        json_str = match.group(1)
-                        json_str = re.sub(r'(\w+):', r'"\1":', json_str)
-                        json_str = json_str.replace("'", '"')
-                        json_str = json_str.replace('\\/', '/')
-                        player_data = json.loads(json_str)
-                        if 'file' in player_data:
-                            print(f"Found player data with pattern: {pattern}")
-                            break
-                    except Exception as e:
-                        print(f"Pattern failed: {e}")
-                        continue
-            
-            if not player_data or 'file' not in player_data:
-                return {
-                    'success': False,
-                    'error': 'Could not extract player data',
-                    'video_id': video_id
-                }
-            
-            file_url = player_data['file']
-            referrer = player_data.get('referrer', urlparse(play_url).netloc)
-            
-            print(f"File URL: {file_url}")
-            print(f"Referrer: {referrer}")
-            
-            # Fetch the file
-            file_response = self.session.get(
-                file_url,
-                headers={'Referer': f"https://{referrer}"},
-                timeout=15
-            )
-            
-            content = file_response.text
-            print(f"Content length: {len(content)}")
-            
-            # Extract m3u8 URLs
-            m3u8_pattern = r'https?://[^\s"\']+\.m3u8[^\s"\']*'
-            m3u8_links = re.findall(m3u8_pattern, content)
-            
-            # If no m3u8 found, try parsing as playlist
-            if not m3u8_links and '#EXTM3U' in content:
-                lines = content.strip().split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('#') and 'http' in line:
-                        m3u8_links.append(line)
-            
-            m3u8_links = list(dict.fromkeys(m3u8_links))
-            
-            if m3u8_links:
-                return {
-                    'success': True,
-                    'video_id': video_id,
-                    'm3u8_links': m3u8_links,
-                    'source_url': play_url
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': 'No m3u8 links found',
-                    'video_id': video_id,
-                    'content_preview': content[:200]
-                }
-                
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            }
-
-# Flask routes
-@app.route('/api/extract', methods=['GET', 'POST'])
-def extract():
-    try:
-        if request.method == 'GET':
-            url = request.args.get('url')
-        else:
-            data = request.get_json(silent=True)
-            url = data.get('url') if data else None
+    if (!host) {
+      return res.status(500).json({ error: 'Could not extract host from player script' });
+    }
+    
+    const referer = `${allmovielandAPI}/`;
+    
+    // Get playlist data
+    const playlistData = await getPlaylistData(host, id as string, referer);
+    if (!playlistData) {
+      return res.status(404).json({ error: 'Playlist not found' });
+    }
+    
+    const json = parseJson<AllMovielandPlaylist>(`{${playlistData}`);
+    if (!json?.key || !json?.file) {
+      return res.status(404).json({ error: 'Invalid playlist data' });
+    }
+    
+    // Get servers
+    const fixedUrl = json.file.startsWith('http') ? json.file : `${host}${json.file}`;
+    const serversData = await getServers(fixedUrl, host, json.key, referer);
+    const servers = parseJson<AllMovielandServer[]>(serversData);
+    
+    if (!servers) {
+      return res.status(404).json({ error: 'No servers found' });
+    }
+    
+    let serverList: Array<[string, string]> = [];
+    
+    if (!season) {
+      serverList = servers.map(server => [server.file, server.title]);
+    } else {
+      const seasonNum = parseInt(season as string, 10);
+      const episodeNum = episode ? parseInt(episode as string, 10) : undefined;
+      
+      const seasonData = servers.find(s => s.id === seasonNum.toString());
+      if (seasonData?.folder) {
+        if (episodeNum !== undefined) {
+          const episodeData = seasonData.folder.find(f => f.episode === episodeNum);
+          if (episodeData?.folder) {
+            serverList = episodeData.folder.map(f => [f.file, f.title]);
+          }
+        } else {
+          serverList = seasonData.folder.map(f => [f.file, f.title]);
+        }
+      }
+    }
+    
+    // Fetch all server paths
+    const results = await Promise.all(
+      serverList.map(async ([server, lang]) => {
+        if (!server) return null;
         
-        if not url:
-            return jsonify({'error': 'url parameter required'}), 400
+        const path = await getServerPath(host, server, json.key, referer);
         
-        result = extractor.extract_m3u8_from_url(url)
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({
-            'error': 'Internal server error',
-            'details': str(e)
-        }), 500
-
-@app.route('/api/extract-from-example', methods=['GET'])
-def extract_from_example():
-    try:
-        example_url = "https://piexe411qok.com/play/tt42730027"
-        result = extractor.extract_m3u8_from_url(example_url)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'python_version': sys.version
-    })
-
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({
-        'service': 'AllMovieLand M3U8 Extractor',
-        'endpoints': {
-            '/api/extract': 'GET/POST - use ?url=PLAY_URL',
-            '/api/extract-from-example': 'GET - test endpoint',
-            '/api/health': 'GET - health check'
-        },
-        'example': '/api/extract?url=https://piexe411qok.com/play/tt42730027'
-    })
-
-# Create extractor instance
-extractor = AllMovieLandM3UExtractor()
-
-# This is required for Vercel
-handler = app
+        return {
+          name: `Allmovieland [${lang}]`,
+          url: path,
+          type: 'm3u8',
+          quality: '1080',
+          referer: referer
+        };
+      })
+    );
+    
+    const validResults = results.filter(r => r !== null);
+    
+    return res.status(200).json({
+      success: true,
+      sources: validResults
+    });
+    
+  } catch (error) {
+    console.error('Error in allmovieland handler:', error);
+    return res.status(500).json({ 
+      error: 'Internal server error',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+}
