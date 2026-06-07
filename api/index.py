@@ -1,36 +1,13 @@
 # api/index.py
+from flask import Flask, request, jsonify
+import requests
+import re
+import json
+from urllib.parse import urlparse
 import sys
 import traceback
 
-try:
-    from flask import Flask, request, jsonify
-    import requests
-    import re
-    import json
-    from urllib.parse import urlparse
-except ImportError as e:
-    # Fallback for missing dependencies
-    print(f"Import error: {e}")
-    # Create a basic app without dependencies
-    app = Flask(__name__)
-    
-    @app.route('/')
-    def error_page():
-        return jsonify({'error': 'Missing dependencies', 'details': str(e)}), 500
-    
-    @app.route('/api/health')
-    def health():
-        return jsonify({'status': 'error', 'message': 'Dependencies not installed'})
-    
-    @app.route('/api/extract')
-    def extract_error():
-        return jsonify({'error': 'Dependencies not installed properly'}), 500
-    
-    # Run the app
-    if __name__ == '__main__':
-        app.run()
-else:
-    app = Flask(__name__)
+app = Flask(__name__)
 
 class AllMovieLandM3UExtractor:
     def __init__(self):
@@ -53,10 +30,11 @@ class AllMovieLandM3UExtractor:
             video_id = video_id_match.group(1) if video_id_match else None
             
             # Fetch player page
+            print(f"Fetching: {play_url}")
             response = self.session.get(play_url, timeout=15)
             html = response.text
             
-            # Find player data - method 1
+            # Find player data
             player_data = None
             patterns = [
                 r'let\s+p3\s*=\s*({.*?});',
@@ -70,14 +48,15 @@ class AllMovieLandM3UExtractor:
                 if match:
                     try:
                         json_str = match.group(1)
-                        # Clean up JSON
                         json_str = re.sub(r'(\w+):', r'"\1":', json_str)
                         json_str = json_str.replace("'", '"')
                         json_str = json_str.replace('\\/', '/')
                         player_data = json.loads(json_str)
                         if 'file' in player_data:
+                            print(f"Found player data with pattern: {pattern}")
                             break
-                    except:
+                    except Exception as e:
+                        print(f"Pattern failed: {e}")
                         continue
             
             if not player_data or 'file' not in player_data:
@@ -90,6 +69,9 @@ class AllMovieLandM3UExtractor:
             file_url = player_data['file']
             referrer = player_data.get('referrer', urlparse(play_url).netloc)
             
+            print(f"File URL: {file_url}")
+            print(f"Referrer: {referrer}")
+            
             # Fetch the file
             file_response = self.session.get(
                 file_url,
@@ -98,6 +80,7 @@ class AllMovieLandM3UExtractor:
             )
             
             content = file_response.text
+            print(f"Content length: {len(content)}")
             
             # Extract m3u8 URLs
             m3u8_pattern = r'https?://[^\s"\']+\.m3u8[^\s"\']*'
@@ -135,8 +118,7 @@ class AllMovieLandM3UExtractor:
                 'traceback': traceback.format_exc()
             }
 
-extractor = AllMovieLandM3UExtractor()
-
+# Flask routes
 @app.route('/api/extract', methods=['GET', 'POST'])
 def extract():
     try:
@@ -144,7 +126,7 @@ def extract():
             url = request.args.get('url')
         else:
             data = request.get_json(silent=True)
-            url = data.get('url') if data else request.form.get('url')
+            url = data.get('url') if data else None
         
         if not url:
             return jsonify({'error': 'url parameter required'}), 400
@@ -155,8 +137,7 @@ def extract():
     except Exception as e:
         return jsonify({
             'error': 'Internal server error',
-            'details': str(e),
-            'traceback': traceback.format_exc()
+            'details': str(e)
         }), 500
 
 @app.route('/api/extract-from-example', methods=['GET'])
@@ -172,8 +153,7 @@ def extract_from_example():
 def health_check():
     return jsonify({
         'status': 'healthy',
-        'python_version': sys.version,
-        'dependencies_loaded': True
+        'python_version': sys.version
     })
 
 @app.route('/', methods=['GET'])
@@ -188,6 +168,8 @@ def index():
         'example': '/api/extract?url=https://piexe411qok.com/play/tt42730027'
     })
 
-# For local development
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+# Create extractor instance
+extractor = AllMovieLandM3UExtractor()
+
+# This is required for Vercel
+handler = app
