@@ -1,11 +1,5 @@
 {
   "name": "allmovieland-api",
   "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "build": "echo 'Building for Vercel'"
-  },
-  "dependencies": {
-    "@vercel/node": "^3.0.0"
-  }
+  "type": "module"
 }
