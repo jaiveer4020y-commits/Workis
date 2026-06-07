@@ -1,10 +1,4 @@
 {
-  "functions": {
-    "api/allmovieland.ts": {
-      "memory": 1024,
-      "maxDuration": 10
-    }
-  },
   "headers": [
     {
       "source": "/api/(.*)",
