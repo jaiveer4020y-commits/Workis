@@ -1,7 +1,7 @@
 // api/allmovieland.js
 
 /**
- * Configuration & Constants
+ * CONFIGURATION
  */
 const PROXY_URL = 'https://workingg.vercel.app/api/proxy?source=2&url=';
 const FALLBACK_DOMAINS = ['https://gemma416okl.com', 'https://keymi417exx.com'];
@@ -14,7 +14,7 @@ const DEFAULT_HEADERS = {
 let cachedDomain = null;
 
 /**
- * Utility: Fetch with timeout
+ * UTILITIES
  */
 async function fetchWithTimeout(url, options = {}, timeout = 8000) {
   const controller = new AbortController();
@@ -29,23 +29,17 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
   }
 }
 
-/**
- * Utility: Proxy Fetcher
- */
 async function fetchViaProxy(url, options = {}) {
   const proxyUrl = `${PROXY_URL}${encodeURIComponent(url)}`;
   try {
     const res = await fetchWithTimeout(proxyUrl, options);
     if (res.ok) return res;
   } catch (e) {
-    console.warn(`Proxy failed for ${url}: ${e.message}`);
+    console.warn(`[DEBUG] Proxy failed for ${url}: ${e.message}`);
   }
-  return fetchWithTimeout(url, options); // Fallback to direct
+  return fetchWithTimeout(url, options);
 }
 
-/**
- * Helper: Resolve dynamic URLs
- */
 function resolveUrl(baseUrl, path) {
   if (path.startsWith('http')) return path;
   if (path.startsWith('/playlist')) return `${baseUrl}${path}`;
@@ -53,9 +47,6 @@ function resolveUrl(baseUrl, path) {
   return `${baseUrl}/playlist/${path}`;
 }
 
-/**
- * Service: Discover current streaming domain
- */
 async function getStreamingDomain() {
   if (cachedDomain) return cachedDomain;
 
@@ -68,7 +59,7 @@ async function getStreamingDomain() {
       return cachedDomain;
     }
   } catch (e) {
-    console.error('Player.js extraction failed.');
+    console.error('[DEBUG] Player.js extraction failed.');
   }
 
   for (const domain of FALLBACK_DOMAINS) {
@@ -81,7 +72,7 @@ async function getStreamingDomain() {
 }
 
 /**
- * Main Handler
+ * MAIN HANDLER
  */
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -95,18 +86,28 @@ export default async function handler(req, res) {
     const domain = await getStreamingDomain();
     const pageUrl = `${domain}/play/${id}${season && episode ? `/s${season}-e${episode}` : ''}`;
     
+    console.log(`[DEBUG] Fetching page: ${pageUrl}`);
     const pageRes = await fetchViaProxy(pageUrl, { headers: DEFAULT_HEADERS });
     const html = await pageRes.text();
-    const p3Match = html.match(/(?:let|var|const)\s+p3\s*=\s*(\{[^;]+\});/);
-    
-    if (!p3Match) throw new Error('Could not find p3 configuration');
-    const p3 = JSON.parse(p3Match[1]);
 
+    // Debugging checks
+    if (html.length < 500 || html.includes('captcha') || html.includes('Cloudflare')) {
+      console.error(`[DEBUG] Blocked or empty response. HTML Length: ${html.length}`);
+      throw new Error('Target site returned a block page or unexpected content');
+    }
+
+    const p3Match = html.match(/(?:let|var|const)\s+p3\s*=\s*(\{[^;]+\});/);
+    if (!p3Match) {
+      console.error(`[DEBUG] Failed to find p3. HTML snippet: ${html.substring(0, 300)}`);
+      throw new Error('Could not find p3 configuration');
+    }
+    
+    const p3 = JSON.parse(p3Match[1]);
     const langRes = await fetchViaProxy(resolveUrl(domain, p3.file), {
       headers: { ...DEFAULT_HEADERS, 'X-CSRF-TOKEN': p3.key }
     });
+    
     const languages = await langRes.json();
-
     for (const lang of languages) {
       if (!lang.file || lang.file === '-') continue;
 
@@ -118,7 +119,6 @@ export default async function handler(req, res) {
       const content = (await streamRes.text()).trim();
       if (!content) continue;
 
-      // Handle both direct URLs and JSON quality lists
       if (content.startsWith('[')) {
         const qualities = JSON.parse(content);
         const streams = qualities
@@ -130,15 +130,12 @@ export default async function handler(req, res) {
         return res.status(200).json({ success: true, streams });
       } 
       
-      return res.status(200).json({ 
-        success: true, 
-        streams: [{ language: lang.title, url: content }] 
-      });
+      return res.status(200).json({ success: true, streams: [{ language: lang.title, url: content }] });
     }
 
-    throw new Error('No valid streams could be parsed');
+    throw new Error('No valid streams found');
   } catch (err) {
-    console.error('API Error:', err.message);
+    console.error('[API ERROR]', err.message);
     return res.status(500).json({ error: err.message });
   }
 }
