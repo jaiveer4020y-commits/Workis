@@ -1,6 +1,6 @@
 // api/allmovieland.js
 
-// Known domains that have worked recently (update as needed)
+// Known domains (update periodically)
 const KNOWN_DOMAINS = [
   'https://gemma416okl.com',
   'https://keymi417exx.com',
@@ -8,7 +8,6 @@ const KNOWN_DOMAINS = [
   'https://allmovieland.rest'
 ];
 
-// Fetch streaming domain from player.js or fallback
 async function getStreamingDomain() {
   const playerJsUrl = 'https://allmovieland.link/player.js?v=60%20128';
   const headers = {
@@ -18,7 +17,6 @@ async function getStreamingDomain() {
     'Connection': 'Keep-Alive',
     'Accept-Encoding': 'gzip'
   };
-
   try {
     const response = await fetch(playerJsUrl, { headers });
     const scriptText = await response.text();
@@ -38,12 +36,11 @@ async function getStreamingDomain() {
       }
     }
   } catch (e) {
-    console.log('Failed to fetch player.js, using fallback domains');
+    console.error('getStreamingDomain error:', e.message);
   }
   return null;
 }
 
-// Test if a domain works for a given ID (and season/episode)
 async function testDomain(domain, id, season, episode) {
   let url = `${domain}/play/${id}`;
   if (season && episode) url += `/s${season}-e${episode}`;
@@ -53,14 +50,14 @@ async function testDomain(domain, id, season, episode) {
     'Host': new URL(domain).hostname
   };
   try {
-    const res = await fetch(url, { method: 'HEAD', headers });
-    return res.ok;
-  } catch {
-    return false;
+    // Use GET because some servers block HEAD
+    const res = await fetch(url, { method: 'GET', headers });
+    return { ok: res.ok, status: res.status, url };
+  } catch (err) {
+    return { ok: false, status: 0, url, error: err.message };
   }
 }
 
-// Extract p3 object from HTML
 function extractP3Object(html) {
   const patterns = [
     /let p3 = (\{[^;]+\});/,
@@ -80,38 +77,56 @@ function extractP3Object(html) {
 }
 
 export default async function handler(req, res) {
+  // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  let { id, season, episode } = req.query;
+  let { id, season, episode, debug } = req.query;
   if (!id) return res.status(400).json({ error: 'Missing id parameter' });
-
-  // Convert season/episode to numbers if present
   if (season) season = parseInt(season);
   if (episode) episode = parseInt(episode);
 
+  const debugLog = []; // collect debug messages
+
   try {
-    // Step 1: Get candidate domains (extracted + known)
-    let extractedDomain = await getStreamingDomain();
-    let domainsToTry = extractedDomain ? [extractedDomain, ...KNOWN_DOMAINS] : [...KNOWN_DOMAINS];
-    domainsToTry = [...new Set(domainsToTry)]; // remove duplicates
+    // Step 1: get extracted domain
+    const extracted = await getStreamingDomain();
+    debugLog.push(`Extracted from player.js: ${extracted || 'none'}`);
+    let candidates = extracted ? [extracted, ...KNOWN_DOMAINS] : [...KNOWN_DOMAINS];
+    candidates = [...new Set(candidates)];
+    debugLog.push(`Candidates: ${candidates.join(', ')}`);
 
     let workingDomain = null;
-    for (const domain of domainsToTry) {
-      console.log(`Testing domain: ${domain}`);
-      if (await testDomain(domain, id, season, episode)) {
+    let domainTestResults = [];
+    for (const domain of candidates) {
+      const result = await testDomain(domain, id, season, episode);
+      domainTestResults.push(result);
+      debugLog.push(`Test ${domain} -> status ${result.status} ${result.ok ? 'OK' : 'FAIL'}`);
+      if (result.ok) {
         workingDomain = domain;
         break;
       }
     }
-    if (!workingDomain) {
-      return res.status(404).json({ error: 'No working domain found for this ID' });
-    }
-    console.log(`✅ Using domain: ${workingDomain}`);
 
-    // Step 2: Fetch movie page
+    if (!workingDomain) {
+      // Return detailed debug info
+      return res.status(404).json({
+        error: 'No working domain found for this ID',
+        debug: {
+          id,
+          season,
+          episode,
+          candidates_tested: domainTestResults,
+          logs: debugLog
+        }
+      });
+    }
+
+    debugLog.push(`✅ Using domain: ${workingDomain}`);
+
+    // Step 2: fetch movie page
     let pageUrl = `${workingDomain}/play/${id}`;
     if (season && episode) pageUrl += `/s${season}-e${episode}`;
     const pageHeaders = {
@@ -120,32 +135,48 @@ export default async function handler(req, res) {
       'Host': new URL(workingDomain).hostname
     };
     const pageRes = await fetch(pageUrl, { headers: pageHeaders });
-    if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status} from movie page`);
+    if (!pageRes.ok) {
+      return res.status(500).json({
+        error: `Movie page returned ${pageRes.status}`,
+        debug: { url: pageUrl, status: pageRes.status, logs: debugLog }
+      });
+    }
     const html = await pageRes.text();
+    debugLog.push(`Movie page fetched (${html.length} bytes)`);
 
-    // Step 3: Extract p3
+    // Step 3: extract p3
     const p3 = extractP3Object(html);
-    if (!p3) throw new Error('Could not extract p3 object');
-    console.log('✅ p3 extracted');
+    if (!p3) {
+      return res.status(500).json({
+        error: 'Could not extract p3 object from page',
+        debug: { html_preview: html.substring(0, 500), logs: debugLog }
+      });
+    }
+    debugLog.push('p3 object extracted');
 
-    // Step 4: Get language list
+    // Step 4: get language list
     let langUrl = p3.file;
     if (langUrl.startsWith('/playlist')) {
       langUrl = workingDomain + langUrl;
     } else if (!langUrl.startsWith('http')) {
       langUrl = workingDomain + '/playlist/' + langUrl;
     }
-    const langRes = await fetch(langUrl, {
-      headers: {
-        'X-CSRF-TOKEN': p3.key,
-        'Referer': 'https://allmovieland.link/',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
+    const langHeaders = {
+      'X-CSRF-TOKEN': p3.key,
+      'Referer': 'https://allmovieland.link/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    };
+    const langRes = await fetch(langUrl, { headers: langHeaders });
+    if (!langRes.ok) {
+      return res.status(500).json({
+        error: `Language list request failed: ${langRes.status}`,
+        debug: { url: langUrl, status: langRes.status, logs: debugLog }
+      });
+    }
     const languages = await langRes.json();
-    console.log(`✅ Languages: ${languages.map(l => l.title).join(', ')}`);
+    debugLog.push(`Languages: ${languages.map(l => l.title).join(', ')}`);
 
-    // Step 5: Process each language
+    // Step 5: process streams
     const streams = [];
     for (const lang of languages) {
       if (lang.file && lang.file !== '-') {
@@ -166,6 +197,10 @@ export default async function handler(req, res) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
           }
         });
+        if (!streamRes.ok) {
+          debugLog.push(`Stream fetch failed for ${lang.title}: ${streamRes.status}`);
+          continue;
+        }
         const content = await streamRes.text();
         const trimmed = content.trim();
 
@@ -192,10 +227,22 @@ export default async function handler(req, res) {
       }
     }
 
-    if (streams.length === 0) throw new Error('No streams found');
-    return res.status(200).json({ success: true, streams });
+    if (streams.length === 0) {
+      return res.status(500).json({
+        error: 'No streams found',
+        debug: { logs: debugLog }
+      });
+    }
+
+    // If debug flag is present, include logs in response
+    const response = { success: true, streams };
+    if (debug === 'true') response.debug = { logs: debugLog };
+    return res.status(200).json(response);
   } catch (error) {
     console.error(error);
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({
+      error: error.message,
+      debug: { logs: debugLog, stack: error.stack }
+    });
   }
 }
