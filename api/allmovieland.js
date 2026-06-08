@@ -78,7 +78,7 @@ async function getStreamingDomain() {
   for (const domain of FALLBACK_DOMAINS) {
     try {
       const testUrl = `${domain}/play/tt33014583`;
-      const res = await fetchWithTimeout(testUrl, { method: 'HEAD' }, 3000);
+      const res = await fetchWithTimeout(testUrl, { method: 'GET' }, 3000);
       if (res.ok) {
         cachedDomain = domain;
         return domain;
