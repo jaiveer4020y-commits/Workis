@@ -1,17 +1,21 @@
 // api/allmovieland.js
 
-// ======================== CONFIGURATION ========================
+/**
+ * Configuration & Constants
+ */
 const PROXY_URL = 'https://workingg.vercel.app/api/proxy?source=2&url=';
-const DIRECT_FALLBACK = true;  // fallback to direct fetch (may fail due to CORS but faster)
+const FALLBACK_DOMAINS = ['https://gemma416okl.com', 'https://keymi417exx.com'];
+const PLAYER_JS_URL = 'https://allmovieland.link/player.js?v=60%20128';
+const DEFAULT_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  'Referer': 'https://allmovieland.one/'
+};
 
-// Hardcoded fallback domains (update when known)
-const FALLBACK_DOMAINS = [
-  'https://gemma416okl.com',
-  'https://keymi417exx.com'
-];
-// ================================================================
+let cachedDomain = null;
 
-// Fast fetch with timeout (max 8 seconds per request)
+/**
+ * Utility: Fetch with timeout
+ */
 async function fetchWithTimeout(url, options = {}, timeout = 8000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
@@ -25,80 +29,61 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
   }
 }
 
-// Fetch via proxy (primary) or fallback to direct
+/**
+ * Utility: Proxy Fetcher
+ */
 async function fetchViaProxy(url, options = {}) {
-  // Try proxy first
-  const proxyUrl = PROXY_URL + encodeURIComponent(url);
+  const proxyUrl = `${PROXY_URL}${encodeURIComponent(url)}`;
   try {
-    const res = await fetchWithTimeout(proxyUrl, {
-      method: options.method || 'GET',
-      headers: options.headers || {}
-    });
+    const res = await fetchWithTimeout(proxyUrl, options);
     if (res.ok) return res;
   } catch (e) {
-    console.log(`Proxy failed: ${e.message}`);
+    console.warn(`Proxy failed for ${url}: ${e.message}`);
   }
-
-  // Fallback to direct fetch (faster but may have CORS)
-  if (DIRECT_FALLBACK) {
-    console.log('Falling back to direct fetch');
-    const res = await fetchWithTimeout(url, options);
-    if (res.ok) return res;
-  }
-  throw new Error(`All fetch attempts failed for ${url}`);
+  return fetchWithTimeout(url, options); // Fallback to direct
 }
 
-// Get streaming domain (cached in memory)
-let cachedDomain = null;
+/**
+ * Helper: Resolve dynamic URLs
+ */
+function resolveUrl(baseUrl, path) {
+  if (path.startsWith('http')) return path;
+  if (path.startsWith('/playlist')) return `${baseUrl}${path}`;
+  if (path.startsWith('~')) return `${baseUrl}/playlist${path.slice(1)}`;
+  return `${baseUrl}/playlist/${path}`;
+}
+
+/**
+ * Service: Discover current streaming domain
+ */
 async function getStreamingDomain() {
   if (cachedDomain) return cachedDomain;
 
-  // Try to extract from player.js
-  const playerUrl = 'https://allmovieland.link/player.js?v=60%20128';
   try {
-    const res = await fetchViaProxy(playerUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Cache-Control': 'max-age=0'
-      }
-    });
+    const res = await fetchViaProxy(PLAYER_JS_URL, { headers: DEFAULT_HEADERS });
     const text = await res.text();
     const match = text.match(/AwsIndStreamDomain\s*=\s*['"]([^'"]+)['"]/);
-    if (match && match[1]) {
-      let domain = match[1];
-      if (!domain.startsWith('http')) domain = 'https://' + domain;
-      cachedDomain = domain;
-      return domain;
+    if (match?.[1]) {
+      cachedDomain = match[1].startsWith('http') ? match[1] : `https://${match[1]}`;
+      return cachedDomain;
     }
   } catch (e) {
-    console.log('Player.js extraction failed, using fallback domains');
+    console.error('Player.js extraction failed.');
   }
 
-  // Use fallback domains
   for (const domain of FALLBACK_DOMAINS) {
     try {
-      const testUrl = `${domain}/play/tt33014583`;
-      const res = await fetchWithTimeout(testUrl, { method: 'GET' }, 3000);
-      if (res.ok) {
-        cachedDomain = domain;
-        return domain;
-      }
+      const res = await fetchWithTimeout(`${domain}/play/tt33014583`, { method: 'HEAD' }, 3000);
+      if (res.ok) return (cachedDomain = domain);
     } catch (e) {}
   }
-  throw new Error('No working domain found');
+  throw new Error('No working streaming domain found');
 }
 
-// Extract p3 object (fast)
-function extractP3(html) {
-  const match = html.match(/(?:let|var|const)\s+p3\s*=\s*(\{[^;]+\});/);
-  if (match) {
-    try { return JSON.parse(match[1]); } catch(e) {}
-  }
-  return null;
-}
-
+/**
+ * Main Handler
+ */
 export default async function handler(req, res) {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -107,83 +92,53 @@ export default async function handler(req, res) {
   if (!id) return res.status(400).json({ error: 'Missing id' });
 
   try {
-    // Get domain (cached)
     const domain = await getStreamingDomain();
-
-    // Build page URL
-    let pageUrl = `${domain}/play/${id}`;
-    if (season && episode) pageUrl += `/s${season}-e${episode}`;
-
-    // Fetch movie page
-    const pageRes = await fetchViaProxy(pageUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://allmovieland.one/'
-      }
-    });
+    const pageUrl = `${domain}/play/${id}${season && episode ? `/s${season}-e${episode}` : ''}`;
+    
+    const pageRes = await fetchViaProxy(pageUrl, { headers: DEFAULT_HEADERS });
     const html = await pageRes.text();
-    const p3 = extractP3(html);
-    if (!p3) throw new Error('No p3 object');
+    const p3Match = html.match(/(?:let|var|const)\s+p3\s*=\s*(\{[^;]+\});/);
+    
+    if (!p3Match) throw new Error('Could not find p3 configuration');
+    const p3 = JSON.parse(p3Match[1]);
 
-    // Fetch language list (first .txt)
-    let langUrl = p3.file;
-    if (langUrl.startsWith('/playlist')) langUrl = domain + langUrl;
-    else if (!langUrl.startsWith('http')) langUrl = domain + '/playlist/' + langUrl;
-
-    const langRes = await fetchViaProxy(langUrl, {
-      headers: {
-        'X-CSRF-TOKEN': p3.key,
-        'Referer': 'https://allmovieland.link/'
-      }
+    const langRes = await fetchViaProxy(resolveUrl(domain, p3.file), {
+      headers: { ...DEFAULT_HEADERS, 'X-CSRF-TOKEN': p3.key }
     });
     const languages = await langRes.json();
 
-    // For each language, get the stream URL – but stop after first working one to save time
-    let streams = [];
     for (const lang of languages) {
       if (!lang.file || lang.file === '-') continue;
-      let streamUrl = lang.file;
-      if (streamUrl.startsWith('/playlist')) streamUrl = domain + streamUrl;
-      else if (streamUrl.startsWith('~')) streamUrl = domain + '/playlist' + streamUrl;
-      else if (!streamUrl.startsWith('http')) streamUrl = domain + '/playlist/' + streamUrl;
-      if (!streamUrl.endsWith('.txt')) streamUrl += '.txt';
 
+      const streamUrl = resolveUrl(domain, lang.file.endsWith('.txt') ? lang.file : `${lang.file}.txt`);
       const streamRes = await fetchViaProxy(streamUrl, {
-        headers: {
-          'X-CSRF-TOKEN': p3.key,
-          'Referer': 'https://allmovieland.one/'
-        }
+        headers: { ...DEFAULT_HEADERS, 'X-CSRF-TOKEN': p3.key }
       });
-      if (!streamRes.ok) continue;
-      const content = await streamRes.text();
-      const trimmed = content.trim();
+      
+      const content = (await streamRes.text()).trim();
+      if (!content) continue;
 
-      if (trimmed.startsWith('[')) {
-        const qualities = JSON.parse(trimmed);
-        for (const q of qualities) {
-          if (q.file && q.file !== '-') {
-            let qUrl = q.file;
-            if (qUrl.startsWith('/playlist')) qUrl = domain + qUrl;
-            else if (qUrl.startsWith('~')) qUrl = domain + '/playlist' + qUrl;
-            else if (!qUrl.startsWith('http')) qUrl = domain + '/playlist/' + qUrl;
-            if (!qUrl.endsWith('.txt')) qUrl += '.txt';
-            streams.push({ language: `${lang.title} - ${q.title || 'HD'}`, url: qUrl });
-          }
-        }
-      } else if (trimmed.startsWith('http')) {
-        streams.push({ language: lang.title, url: trimmed });
-        break; // take first working stream to save time
-      } else {
-        streams.push({ language: lang.title, url: streamUrl });
-        break;
-      }
-      if (streams.length > 0) break; // stop after first stream
+      // Handle both direct URLs and JSON quality lists
+      if (content.startsWith('[')) {
+        const qualities = JSON.parse(content);
+        const streams = qualities
+          .filter(q => q.file && q.file !== '-')
+          .map(q => ({
+            language: `${lang.title} - ${q.title || 'HD'}`,
+            url: resolveUrl(domain, q.file.endsWith('.txt') ? q.file : `${q.file}.txt`)
+          }));
+        return res.status(200).json({ success: true, streams });
+      } 
+      
+      return res.status(200).json({ 
+        success: true, 
+        streams: [{ language: lang.title, url: content }] 
+      });
     }
 
-    if (streams.length === 0) throw new Error('No streams found');
-    return res.status(200).json({ success: true, streams });
+    throw new Error('No valid streams could be parsed');
   } catch (err) {
-    console.error(err);
+    console.error('API Error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 }
