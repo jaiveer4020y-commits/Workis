@@ -1,124 +1,188 @@
+// api/allmovieland.js
+
+// Helper function to extract the streaming domain from player.js
+async function getStreamingDomain() {
+  const playerJsUrl = 'https://allmovieland.link/player.js?v=60%20128';
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+    'Cache-Control': 'max-age=0',
+    'Host': 'allmovieland.link',
+    'Connection': 'Keep-Alive',
+    'Accept-Encoding': 'gzip'
+  };
+
+  const response = await fetch(playerJsUrl, { headers });
+  const scriptText = await response.text();
+
+  // Extract domain using regex
+  const match = scriptText.match(/const AwsIndStreamDomain = '([^']+)';/);
+  if (!match) throw new Error('Could not extract streaming domain from player.js');
+  return match[1];
+}
+
+// Helper function to extract p3 object from movie page HTML
+function extractP3Object(html) {
+  // Try to find p3 object with let, var, or const
+  const patterns = [
+    /let p3 = (\{[^;]+\});/,
+    /var p3 = (\{[^;]+\});/,
+    /const p3 = (\{[^;]+\});/
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) {
+      try {
+        return JSON.parse(match[1]);
+      } catch (e) {
+        console.error('Failed to parse p3 object:', e);
+      }
+    }
+  }
+  return null;
+}
+
+// Main Vercel handler
 export default async function handler(req, res) {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
-  // Handle preflight requests
+
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
-  
-  // Allow only GET requests
-  if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method not allowed. Use GET.' });
-  }
-  
-  // Get the movie ID from query parameters
+
   const { id } = req.query;
-  
-  // Validate required parameters
+
   if (!id) {
-    return res.status(400).json({ 
-      error: 'Missing parameter',
-      message: 'id parameter is required. Example: ?id=tt33014583'
-    });
+    return res.status(400).json({ error: 'Missing id parameter' });
   }
-  
+
   try {
-    console.log(`🎬 Processing request for ID: ${id}`);
-    
-    // Fetch the player page directly (domain is known)
-    const playerUrl = `https://gemma416okl.com/play/${id}`;
-    console.log(`📡 Fetching: ${playerUrl}`);
-    
-    const response = await fetch(playerUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://allmovieland.link/'
-      }
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    // Step 1: Get the streaming domain
+    const domain = await getStreamingDomain();
+    console.log(`✅ Streaming domain: ${domain}`);
+
+    // Step 2: Fetch the movie page
+    const moviePageUrl = `${domain}/play/${id}`;
+    const moviePageHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36',
+      'Referer': 'https://allmovieland.one/',
+      'Host': new URL(domain).hostname,
+      'Connection': 'Keep-Alive',
+      'Accept-Encoding': 'gzip'
+    };
+
+    const moviePageResponse = await fetch(moviePageUrl, { headers: moviePageHeaders });
+    const html = await moviePageResponse.text();
+    console.log(`✅ Movie page fetched (${html.length} bytes)`);
+
+    // Step 3: Extract p3 object
+    const p3 = extractP3Object(html);
+    if (!p3) {
+      return res.status(500).json({ error: 'Could not extract p3 object from page' });
     }
-    
-    const html = await response.text();
-    console.log(`📄 Page fetched, size: ${html.length} bytes`);
-    
-    // Extract video data from script
-    let videoData = null;
-    let match = html.match(/let p3 = (\{[^;]+\});/);
-    
-    if (!match) {
-      match = html.match(/var p3 = (\{[^;]+\});/);
+
+    // Step 4: Get the language list from the file URL
+    // The file URL can be either an absolute URL or a relative path
+    let languageListUrl = p3.file;
+    if (languageListUrl.startsWith('/playlist')) {
+      // Relative path - prepend the streaming domain
+      languageListUrl = domain + languageListUrl;
     }
-    
-    if (!match) {
-      match = html.match(/window\.p3 = (\{[^;]+\});/);
-    }
-    
-    if (match) {
-      try {
-        videoData = JSON.parse(match[1]);
-        console.log('✅ Video data extracted successfully');
-      } catch (e) {
-        console.error('Failed to parse video data:', e.message);
-      }
-    }
-    
-    if (!videoData || !videoData.file) {
-      return res.status(404).json({
-        error: 'Video data not found',
-        message: 'Could not extract stream information from the page',
-        htmlPreview: html.substring(0, 300)
-      });
-    }
-    
-    console.log(`📹 Stream file: ${videoData.file.substring(0, 100)}...`);
-    
-    // Get the actual stream URL if it's a .txt file
-    let streamUrl = videoData.file;
-    
-    if (streamUrl && streamUrl.endsWith('.txt')) {
-      console.log('📄 Fetching playlist from .txt file...');
-      const playlistResponse = await fetch(streamUrl, {
-        headers: {
-          'X-CSRF-TOKEN': videoData.key,
-          'Referer': `https://${videoData.host || 'keymi417exx.com'}/`,
-          'User-Agent': 'Mozilla/5.0'
+    // If it's already an absolute URL, use it as is
+
+    const languageListHeaders = {
+      'X-CSRF-TOKEN': p3.key,
+      'Referer': 'https://allmovieland.link/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
+    };
+
+    const languageListResponse = await fetch(languageListUrl, { headers: languageListHeaders });
+    const languages = await languageListResponse.json();
+    console.log(`✅ Found ${languages.length} languages: ${languages.map(l => l.title).join(', ')}`);
+
+    // Step 5: For each language, get the actual stream URL
+    const streams = [];
+
+    for (const lang of languages) {
+      if (lang.file && lang.file !== '-') {
+        let streamUrl = lang.file;
+
+        // Handle file path similarly: if it starts with '/playlist', prepend domain; otherwise use as is
+        if (streamUrl.startsWith('/playlist')) {
+          streamUrl = domain + streamUrl;
+        } else if (streamUrl.startsWith('~')) {
+          // If it starts with '~', it's a relative path that needs the domain
+          streamUrl = domain + '/playlist' + streamUrl;
+        } else if (!streamUrl.startsWith('http')) {
+          // If it doesn't start with http, prepend domain and /playlist
+          streamUrl = `${domain}/playlist/${streamUrl}`;
         }
-      });
-      
-      if (playlistResponse.ok) {
-        streamUrl = await playlistResponse.text();
-        streamUrl = streamUrl.trim();
-        console.log('✅ Playlist fetched successfully');
+
+        // Add .txt extension if missing (some responses may not include it)
+        if (!streamUrl.endsWith('.txt')) {
+          streamUrl += '.txt';
+        }
+
+        const streamHeaders = {
+          'X-CSRF-TOKEN': p3.key,
+          'Referer': 'https://allmovieland.one/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
+        };
+
+        const streamResponse = await fetch(streamUrl, { headers: streamHeaders });
+        const content = await streamResponse.text();
+
+        // Check if the content is a direct M3U8 URL or a nested JSON
+        if (content.trim().startsWith('[')) {
+          // Nested qualities (e.g., different resolutions)
+          const qualities = JSON.parse(content);
+          for (const quality of qualities) {
+            if (quality.file && quality.file !== '-') {
+              let qualityUrl = quality.file;
+              if (qualityUrl.startsWith('/playlist')) {
+                qualityUrl = domain + qualityUrl;
+              } else if (qualityUrl.startsWith('~')) {
+                qualityUrl = domain + '/playlist' + qualityUrl;
+              } else if (!qualityUrl.startsWith('http')) {
+                qualityUrl = `${domain}/playlist/${qualityUrl}`;
+              }
+              if (!qualityUrl.endsWith('.txt')) qualityUrl += '.txt';
+              streams.push({
+                language: `${lang.title} - ${quality.title || 'HD'}`,
+                url: qualityUrl
+              });
+            }
+          }
+        } else if (content.trim().startsWith('http')) {
+          // Direct stream URL (e.g., M3U8)
+          streams.push({
+            language: lang.title,
+            url: content.trim()
+          });
+        } else {
+          // Possibly the response is the stream URL itself
+          streams.push({
+            language: lang.title,
+            url: streamUrl
+          });
+        }
       }
     }
-    
-    // Return the stream URL
+
+    if (streams.length === 0) {
+      return res.status(500).json({ error: 'No streams found' });
+    }
+
     return res.status(200).json({
       success: true,
-      id: id,
-      streamUrl: streamUrl,
-      type: 'm3u8',
-      quality: '1080p',
-      headers: {
-        'X-CSRF-TOKEN': videoData.key,
-        'Referer': `https://${videoData.host}/`
-      }
+      streams
     });
-    
+
   } catch (error) {
-    console.error('💥 Error:', error.message);
-    
-    return res.status(500).json({
-      error: 'Failed to fetch stream',
-      details: error.message,
-      id: id
-    });
+    console.error('Error:', error);
+    return res.status(500).json({ error: error.message });
   }
 }
