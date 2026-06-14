@@ -1,12 +1,10 @@
 // api/proxy.js
-// Polyfill for btoa in older Node versions (Vercel uses Node 18+ but safe)
 if (typeof btoa === 'undefined') {
     global.btoa = function(str) {
         return Buffer.from(str).toString('base64');
     };
 }
 
-// Helper: fetch with required headers for VideoEasy
 async function fetchWithHeaders(url, options = {}) {
     const defaultHeaders = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -19,47 +17,41 @@ async function fetchWithHeaders(url, options = {}) {
         headers: { ...defaultHeaders, ...options.headers }
     });
     if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        let errorBody = '';
+        try { errorBody = await response.text(); } catch(e) {}
+        throw new Error(`HTTP ${response.status}: ${response.statusText} – ${errorBody.substring(0, 500)}`);
     }
     return response;
 }
 
-// Step 1: Get TMDB metadata (title, year, imdbId) using your bingeout proxy
 async function getTmdbMetadata(type, tmdbId, season, episode) {
     const tmdbProxy = 'https://search-proxy.bingeoutofficial.workers.dev';
     if (type === 'movie') {
         const res = await fetch(`${tmdbProxy}/movie/${tmdbId}`);
         if (!res.ok) throw new Error('TMDB movie fetch failed');
         const data = await res.json();
-        // Get IMDb ID
         let imdbId = null;
         try {
             const imdbRes = await fetch(`${tmdbProxy}/movie/${tmdbId}/external_ids`);
-            if (imdbRes.ok) {
-                const imdbData = await imdbRes.json();
-                imdbId = imdbData.imdb_id;
-            }
+            if (imdbRes.ok) imdbId = (await imdbRes.json()).imdb_id;
         } catch (e) {}
         return {
             title: data.title,
             year: data.release_date ? data.release_date.slice(0,4) : '',
             imdbId: imdbId
         };
-    } else { // tv
+    } else {
         const seriesRes = await fetch(`${tmdbProxy}/tv/${tmdbId}`);
         if (!seriesRes.ok) throw new Error('TMDB TV series fetch failed');
         const seriesData = await seriesRes.json();
         let imdbId = null;
         try {
             const imdbRes = await fetch(`${tmdbProxy}/tv/${tmdbId}/external_ids`);
-            if (imdbRes.ok) {
-                const imdbData = await imdbRes.json();
-                imdbId = imdbData.imdb_id;
-            }
+            if (imdbRes.ok) imdbId = (await imdbRes.json()).imdb_id;
         } catch (e) {}
         return {
             title: seriesData.name,
-            year: seriesData.first_air_date ? seriesData.first_air_date.slice(0,4) : '',
+            year: null,
             imdbId: imdbId,
             season: season,
             episode: episode
@@ -67,16 +59,16 @@ async function getTmdbMetadata(type, tmdbId, season, episode) {
     }
 }
 
-// Step 2: Get encrypted hex from VideoEasy API
 async function getVideoEasyHex(type, tmdbId, season, episode, title, year, imdbId) {
     const params = new URLSearchParams();
+    // Use the title exactly as from TMDB (do not uppercase)
     params.append('title', title);
     params.append('mediaType', type === 'tv' ? 'tv' : 'movie');
-    if (year) params.append('year', year);
+    if (type === 'movie' && year) params.append('year', year);
     params.append('tmdbId', tmdbId);
     if (type === 'tv') {
-        if (season) params.append('seasonId', season);
-        if (episode) params.append('episodeId', episode);
+        if (season) params.append('seasonId', String(season));
+        if (episode) params.append('episodeId', String(episode));
     }
     if (imdbId) params.append('imdbId', imdbId);
 
@@ -91,7 +83,6 @@ async function getVideoEasyHex(type, tmdbId, season, episode, title, year, imdbI
     return hexText;
 }
 
-// Step 3: Decrypt hex via enc-dec.app
 async function decryptHex(hexString) {
     const cleanHex = hexString.replace(/\s+/g, '');
     const decryptUrl = 'https://enc-dec.app/api/dec-videasy';
@@ -104,27 +95,18 @@ async function decryptHex(hexString) {
     if (data.status !== 200 || !data.result || !data.result.sources) {
         throw new Error('Decrypt response invalid');
     }
-    return data.result.sources; // array of { quality, url }
+    return data.result.sources;
 }
 
-// Main handler
 export default async function handler(req, res) {
-    // Enable CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-
-    if (req.method !== 'GET') {
-        return res.status(405).json({ error: 'Method not allowed' });
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
     const { id, s, e } = req.query;
-    if (!id) {
-        return res.status(400).json({ status: 'error', message: 'Missing id parameter' });
-    }
+    if (!id) return res.status(400).json({ status: 'error', message: 'Missing id parameter' });
 
     try {
         const isTV = (s !== undefined && e !== undefined);
@@ -134,33 +116,22 @@ export default async function handler(req, res) {
 
         console.log(`[Proxy] Request: type=${type}, id=${id}, s=${season}, e=${episode}`);
 
-        // 1. Get metadata from TMDB
         const metadata = await getTmdbMetadata(type, id, season, episode);
         console.log('[Proxy] Metadata:', metadata);
 
-        // 2. Get encrypted hex from VideoEasy
         const hex = await getVideoEasyHex(type, id, season, episode, metadata.title, metadata.year, metadata.imdbId);
-
-        // 3. Decrypt to get sources
         const sources = await decryptHex(hex);
-        if (!sources.length) {
-            throw new Error('No sources returned after decryption');
-        }
+        if (!sources.length) throw new Error('No sources returned');
 
-        // 4. Pick best source (prefer English, then first)
         const best = sources.find(s => s.quality?.toLowerCase() === 'english') || sources[0];
-
-        // 5. Return success response
-        return res.status(200).json({
-            status: 'success',
-            sources: sources,
-            best: best
-        });
+        return res.status(200).json({ status: 'success', sources, best });
     } catch (error) {
         console.error('[Proxy] Error:', error);
-        return res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+        // Provide a user-friendly message
+        let message = error.message;
+        if (message.includes('HTTP 500')) {
+            message = 'VideoEasy server returned an error – the requested content may not be available.';
+        }
+        return res.status(500).json({ status: 'error', message });
     }
 }
