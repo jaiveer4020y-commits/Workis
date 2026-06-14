@@ -61,7 +61,6 @@ async function getTmdbMetadata(type, tmdbId, season, episode) {
 
 async function getVideoEasyHex(type, tmdbId, season, episode, title, year, imdbId) {
     const params = new URLSearchParams();
-    // Use the title exactly as from TMDB (do not uppercase)
     params.append('title', title);
     params.append('mediaType', type === 'tv' ? 'tv' : 'movie');
     if (type === 'movie' && year) params.append('year', year);
@@ -83,13 +82,16 @@ async function getVideoEasyHex(type, tmdbId, season, episode, title, year, imdbI
     return hexText;
 }
 
-async function decryptHex(hexString) {
+async function decryptHex(hexString, tmdbId) {
     const cleanHex = hexString.replace(/\s+/g, '');
     const decryptUrl = 'https://enc-dec.app/api/dec-videasy';
     const response = await fetchWithHeaders(decryptUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: cleanHex })
+        body: JSON.stringify({ 
+            text: cleanHex,
+            id: tmdbId   // Required by the decrypt API
+        })
     });
     const data = await response.json();
     if (data.status !== 200 || !data.result || !data.result.sources) {
@@ -120,18 +122,13 @@ export default async function handler(req, res) {
         console.log('[Proxy] Metadata:', metadata);
 
         const hex = await getVideoEasyHex(type, id, season, episode, metadata.title, metadata.year, metadata.imdbId);
-        const sources = await decryptHex(hex);
+        const sources = await decryptHex(hex, id);  // ← TMDB ID added here
         if (!sources.length) throw new Error('No sources returned');
 
         const best = sources.find(s => s.quality?.toLowerCase() === 'english') || sources[0];
         return res.status(200).json({ status: 'success', sources, best });
     } catch (error) {
         console.error('[Proxy] Error:', error);
-        // Provide a user-friendly message
-        let message = error.message;
-        if (message.includes('HTTP 500')) {
-            message = 'VideoEasy server returned an error – the requested content may not be available.';
-        }
-        return res.status(500).json({ status: 'error', message });
+        return res.status(500).json({ status: 'error', message: error.message });
     }
 }
